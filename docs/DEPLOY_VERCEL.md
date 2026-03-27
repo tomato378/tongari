@@ -9,7 +9,41 @@ This app is a static Vite frontend, so Vercel is the simplest hosting target.
 
 If you use a private response spreadsheet, the Apps Script bridge must stay deployed separately on Google Apps Script.
 
-## One-time setup
+## GitHub + Vercel dashboard flow
+
+### 1. Log in to GitHub CLI
+
+```bash
+gh auth login
+```
+
+### 2. Create the GitHub repository and push `main`
+
+From the project root:
+
+```bash
+gh repo create
+git push -u origin main
+```
+
+If you want to skip the interactive prompts, you can also run:
+
+```bash
+gh repo create YOUR_REPO_NAME --private --source=. --remote=origin --push
+```
+
+### 3. Import the repository in the Vercel dashboard
+
+1. Open the Vercel dashboard.
+2. Click `New Project`.
+3. Choose `Import Git Repository`.
+4. Connect GitHub if prompted.
+5. Select the repository you just pushed.
+6. Keep the detected Vite settings and deploy.
+
+Once connected, pushes to `main` will trigger production deployments automatically.
+
+## One-time setup without GitHub
 
 1. Create a Vercel account.
 2. In this project directory, run:
@@ -26,10 +60,6 @@ npm run deploy:prod
 ```
 
 Vercel's official Vite docs say you can deploy an existing Vite project by installing the Vercel CLI and running `vercel` from the project root.
-
-## Alternative: dashboard + Git
-
-If you put this project in GitHub/GitLab/Bitbucket, you can import the repo in Vercel and let it build automatically on each push.
 
 ## Notes
 
