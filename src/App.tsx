@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import Papa from 'papaparse'
 import {
   compatibilityRows,
@@ -10,6 +10,12 @@ import {
   type MbtiCounts,
   type ParticipantRecord,
 } from './lib/mbti'
+import {
+  FIXED_GROUPING_SOURCE_URL,
+  FIXED_SPREADSHEET_NAME,
+  FIXED_SPREADSHEET_URL,
+  GROUPING_RESPONSE_HEADERS,
+} from './lib/sheetConfig'
 
 const MIN_GROUP_SIZE = 4
 const MAX_GROUP_SIZE = 6
@@ -18,7 +24,6 @@ const DEFAULT_TARGET_SIZE = 5
 type CsvRow = Record<string, string>
 type ImportMode = 'questionnaire' | 'direct'
 type QuestionColumnKey = 'q1' | 'q2' | 'q3' | 'q4'
-type SourceMode = 'csv' | 'remote'
 
 interface CsvDataSet {
   sourceName: string
@@ -51,6 +56,27 @@ interface AppliedImportState extends ParticipantImportPreview {
   selectionSignature: string
 }
 
+interface ImportSelection {
+  nameColumn: string
+  mbtiColumn: string
+  questionColumns: QuestionColumns
+  mode: ImportMode
+}
+
+interface BoardGroupSnapshot {
+  id: string
+  label: string
+  members: string[]
+}
+
+interface BoardSnapshot {
+  createdAt: string
+  sourceName: string | null
+  totalParticipants: number
+  targetSize: number
+  groups: BoardGroupSnapshot[]
+}
+
 const QUESTION_LABELS: Record<QuestionColumnKey, string> = {
   q1: '質問1 (E / I)',
   q2: '質問2 (S / N)',
@@ -63,6 +89,13 @@ const QUESTION_PATTERNS: Record<QuestionColumnKey, RegExp> = {
   q2: /(質問2|感覚|直観|テーマ|意味)/i,
   q3: /(質問3|思考|感情|判断|基準)/i,
   q4: /(質問4|判断型|知覚型|進める|スタイル)/i,
+}
+
+const PREFERRED_QUESTION_HEADERS: Record<QuestionColumnKey, string> = {
+  q1: GROUPING_RESPONSE_HEADERS[0],
+  q2: GROUPING_RESPONSE_HEADERS[1],
+  q3: GROUPING_RESPONSE_HEADERS[2],
+  q4: GROUPING_RESPONSE_HEADERS[3],
 }
 
 const QUESTION_MAPPINGS: Record<QuestionColumnKey, Record<'A' | 'B', string>> = {
@@ -91,13 +124,18 @@ const EMPTY_APPLIED_IMPORT: AppliedImportState = {
   selectionSignature: '',
 }
 
+const BOARD_STORAGE_KEY = 'tongari-group-board'
+
 function App() {
+  return getAppView() === 'board' ? <BoardPage /> : <MainPage />
+}
+
+function MainPage() {
   const [csvData, setCsvData] = useState<CsvDataSet | null>(null)
   const [csvVersion, setCsvVersion] = useState(0)
   const [parseError, setParseError] = useState<string | null>(null)
-  const [sourceMode, setSourceMode] = useState<SourceMode>('remote')
-  const [remoteUrl, setRemoteUrl] = useState('')
   const [isRemoteLoading, setIsRemoteLoading] = useState(false)
+  const [lastSyncLabel, setLastSyncLabel] = useState<string | null>(null)
   const [nameColumn, setNameColumn] = useState('')
   const [importMode, setImportMode] = useState<ImportMode>('questionnaire')
   const [mbtiColumn, setMbtiColumn] = useState('')
@@ -105,6 +143,15 @@ function App() {
   const [draftTargetSize, setDraftTargetSize] = useState(DEFAULT_TARGET_SIZE)
   const [appliedTargetSize, setAppliedTargetSize] = useState(DEFAULT_TARGET_SIZE)
   const [appliedImport, setAppliedImport] = useState<AppliedImportState>(EMPTY_APPLIED_IMPORT)
+  const latestSelectionRef = useRef<ImportSelection>({
+    nameColumn: '',
+    mbtiColumn: '',
+    questionColumns: EMPTY_QUESTION_COLUMNS,
+    mode: 'questionnaire',
+  })
+  const latestVersionRef = useRef(0)
+  const latestTargetSizeRef = useRef(DEFAULT_TARGET_SIZE)
+  const lastDataSignatureRef = useRef('')
 
   const preview = csvData
     ? buildParticipantPreview({
@@ -124,6 +171,7 @@ function App() {
     minSize: MIN_GROUP_SIZE,
     maxSize: MAX_GROUP_SIZE,
   })
+  const hasBoardData = result.groups.length > 0
 
   const selectionSignature = createSelectionSignature({
     version: csvVersion,
@@ -138,7 +186,9 @@ function App() {
   const statusMessage = parseError
     ? parseError
     : !csvData
-      ? 'Google Form の回答 CSV をアップロードしてください。'
+      ? isRemoteLoading
+        ? '固定スプレッドシートから回答を読み込んでいます。'
+        : '固定スプレッドシートを読み込めていません。再読み込みしてください。'
       : !nameColumn
         ? '名前列を選択してください。'
         : importMode === 'direct' && !mbtiColumn
@@ -156,87 +206,103 @@ function App() {
     (importMode === 'direct' ? Boolean(mbtiColumn) : allQuestionColumnsSelected(questionColumns)) &&
     preview.participants.length > 0
 
+  useEffect(() => {
+    latestSelectionRef.current = {
+      nameColumn,
+      mbtiColumn,
+      questionColumns,
+      mode: importMode,
+    }
+    latestVersionRef.current = csvVersion
+    latestTargetSizeRef.current = draftTargetSize
+  }, [csvVersion, draftTargetSize, importMode, mbtiColumn, nameColumn, questionColumns])
+
+  useEffect(() => {
+    if (!hasBoardData) {
+      return
+    }
+
+    writeBoardSnapshot(
+      createBoardSnapshot({
+        groups: result.groups,
+        sourceName: appliedImport.sourceName,
+        totalParticipants: result.totalParticipants,
+        targetSize: result.plan.targetSize,
+      }),
+    )
+  }, [
+    appliedImport.participants,
+    appliedImport.selectionSignature,
+    appliedImport.sourceName,
+    hasBoardData,
+    appliedTargetSize,
+  ])
+
   const applyImportedDataSet = (dataset: CsvDataSet, warning: string | null = null) => {
-    const defaults = buildDefaultSelection(dataset.headers)
+    const resolvedSelection = resolveImportSelection(
+      dataset.headers,
+      latestSelectionRef.current,
+    )
+    const nextVersion = latestVersionRef.current + 1
+    const nextPreview = buildParticipantPreview({
+      rows: dataset.rows,
+      nameColumn: resolvedSelection.nameColumn,
+      mode: resolvedSelection.mode,
+      mbtiColumn: resolvedSelection.mbtiColumn,
+      questionColumns: resolvedSelection.questionColumns,
+    })
+    const nextSelectionSignature = createSelectionSignature({
+      version: nextVersion,
+      mode: resolvedSelection.mode,
+      nameColumn: resolvedSelection.nameColumn,
+      mbtiColumn: resolvedSelection.mbtiColumn,
+      questionColumns: resolvedSelection.questionColumns,
+    })
+
+    latestSelectionRef.current = resolvedSelection
+    latestVersionRef.current = nextVersion
 
     setCsvData(dataset)
-    setNameColumn(defaults.nameColumn)
-    setMbtiColumn(defaults.mbtiColumn)
-    setQuestionColumns(defaults.questionColumns)
-    setImportMode(defaults.mode)
-    setCsvVersion((current) => current + 1)
+    setNameColumn(resolvedSelection.nameColumn)
+    setMbtiColumn(resolvedSelection.mbtiColumn)
+    setQuestionColumns(resolvedSelection.questionColumns)
+    setImportMode(resolvedSelection.mode)
+    setCsvVersion(nextVersion)
     setParseError(warning)
-  }
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-
-    if (!file) {
-      return
-    }
-
-    Papa.parse<Record<string, string>>(file, {
-      header: true,
-      skipEmptyLines: 'greedy',
-      complete: (parseResult) => {
-        const dataset = buildCsvDataSet(
-          file.name,
-          parseResult.meta.fields ?? [],
-          parseResult.data,
-        )
-
-        if (dataset.headers.length === 0) {
-          setParseError('ヘッダー行を持つ CSV を読み込んでください。')
-          setCsvData(null)
-          return
-        }
-
-        applyImportedDataSet(
-          dataset,
-          parseResult.errors.length > 0
-            ? 'CSV は読み込みましたが、一部の行で解析警告があります。'
-            : null,
-        )
-      },
-      error: (error) => {
-        setParseError(`CSV の読み込みに失敗しました: ${error.message}`)
-        setCsvData(null)
-      },
+    setAppliedImport({
+      ...nextPreview,
+      sourceName: dataset.sourceName,
+      selectionSignature: nextSelectionSignature,
     })
+    setAppliedTargetSize(latestTargetSizeRef.current)
   }
 
-  const handleRemoteLoad = async () => {
-    if (!remoteUrl.trim()) {
-      return
-    }
-
+  const loadFixedSheet = async () => {
     setIsRemoteLoading(true)
 
     try {
-      const { dataset, warning } = await fetchRemoteDataset(remoteUrl.trim())
-      applyImportedDataSet(dataset, warning)
+      const { dataset, warning } = await fetchRemoteDataset(FIXED_GROUPING_SOURCE_URL)
+      const nextSignature = createDataSignature(dataset)
+
+      if (nextSignature !== lastDataSignatureRef.current || !lastDataSignatureRef.current) {
+        lastDataSignatureRef.current = nextSignature
+        applyImportedDataSet(dataset, warning)
+      } else {
+        setParseError(warning)
+      }
+
+      setLastSyncLabel(formatSyncLabel(new Date()))
     } catch (error) {
       const message = error instanceof Error ? error.message : '不明なエラー'
-      setParseError(`スプレッドシートの取得に失敗しました: ${message}`)
+      setParseError(`固定スプレッドシートの取得に失敗しました: ${message}`)
     } finally {
       setIsRemoteLoading(false)
     }
   }
 
-  const clearImportedFile = () => {
-    setCsvData(null)
-    setCsvVersion((current) => current + 1)
-    setParseError(null)
-    setNameColumn('')
-    setMbtiColumn('')
-    setQuestionColumns(EMPTY_QUESTION_COLUMNS)
-    setImportMode('questionnaire')
-    setRemoteUrl('')
-    setSourceMode('remote')
-    setDraftTargetSize(DEFAULT_TARGET_SIZE)
-    setAppliedTargetSize(DEFAULT_TARGET_SIZE)
-    setAppliedImport(EMPTY_APPLIED_IMPORT)
-  }
+  useEffect(() => {
+    void loadFixedSheet()
+  }, [])
 
   const applyCurrentImport = () => {
     setAppliedImport({
@@ -270,14 +336,30 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
+  const openBoardPage = () => {
+    if (!hasBoardData) {
+      return
+    }
+
+    writeBoardSnapshot(
+      createBoardSnapshot({
+        groups: result.groups,
+        sourceName: appliedImport.sourceName,
+        totalParticipants: result.totalParticipants,
+        targetSize: result.plan.targetSize,
+      }),
+    )
+    window.open(buildBoardPageUrl(), '_blank', 'noopener,noreferrer')
+  }
+
   return (
     <div className="app-shell">
       <header className="top-panel">
         <div>
-          <p className="eyebrow">Google Form CSV</p>
-          <h1>スプレッドシートや CSV から MBTI を判定して、名前付きチーム表を生成</h1>
+          <p className="eyebrow">Google Sheets</p>
+          <h1>固定スプレッドシートから回答を読み込み、名前付きチーム表を生成</h1>
           <p className="lead-copy">
-            Google Form の回答シートを直接読むなら Apps Script URL が扱いやすいです。公開シートURLや CSV アップロードにも対応させています。
+            読み込み元は固定の Google スプレッドシートです。画面表示時に最新回答を読み込み、必要なときだけ手動で再読み込みできます。
           </p>
         </div>
 
@@ -306,64 +388,39 @@ function App() {
         <section className="panel control-panel">
           <div className="panel-header">
             <div>
-              <p className="panel-kicker">Import</p>
-              <h2>読み込み元</h2>
+              <p className="panel-kicker">Sheet</p>
+              <h2>回答シート</h2>
             </div>
             <div className="button-row">
-              <button
-                type="button"
+              <a className="secondary-button" href={buildFormPageUrl()}>
+                診断フォームへ
+              </a>
+              <a
                 className="secondary-button"
-                onClick={clearImportedFile}
-                disabled={!csvData && !remoteUrl}
+                href={FIXED_SPREADSHEET_URL}
+                target="_blank"
+                rel="noreferrer"
               >
-                クリア
-              </button>
+                シートを開く
+              </a>
             </div>
           </div>
 
-          <div className="source-toggle">
+          <p className="source-note">{FIXED_SPREADSHEET_NAME}</p>
+          <p className="sync-note">
+            最終同期: {lastSyncLabel ?? '未同期'}
+          </p>
+
+          <div className="button-row import-actions">
             <button
               type="button"
-              className={`source-button ${sourceMode === 'remote' ? 'active' : ''}`}
-              onClick={() => setSourceMode('remote')}
+              className="primary-button"
+              onClick={() => void loadFixedSheet()}
+              disabled={isRemoteLoading}
             >
-              スプレッドシートURL
-            </button>
-            <button
-              type="button"
-              className={`source-button ${sourceMode === 'csv' ? 'active' : ''}`}
-              onClick={() => setSourceMode('csv')}
-            >
-              CSVアップロード
+              {isRemoteLoading ? '取得中...' : '最新の回答を再読み込み'}
             </button>
           </div>
-
-          {sourceMode === 'remote' ? (
-            <div className="remote-row">
-              <input
-                className="url-input"
-                type="url"
-                value={remoteUrl}
-                onChange={(event) => setRemoteUrl(event.target.value)}
-                placeholder="Apps Script の WebアプリURL または公開スプレッドシートURL"
-              />
-              <button
-                type="button"
-                className="primary-button"
-                onClick={handleRemoteLoad}
-                disabled={!remoteUrl.trim() || isRemoteLoading}
-              >
-                {isRemoteLoading ? '取得中...' : 'URLから取得'}
-              </button>
-            </div>
-          ) : (
-            <div className="button-row import-actions">
-              <label className="upload-button">
-                CSVを選択
-                <input type="file" accept=".csv,text/csv" onChange={handleFileChange} />
-              </label>
-            </div>
-          )}
 
           <p className={`status-banner ${parseError ? 'pending' : hasPendingChanges ? 'pending' : 'saved'}`}>
             {statusMessage}
@@ -466,7 +523,7 @@ function App() {
                   onClick={applyCurrentImport}
                   disabled={!canGenerate}
                 >
-                  この CSV でチーム表を作成
+                  この設定で再編成
                 </button>
               </div>
 
@@ -533,7 +590,7 @@ function App() {
             </>
           ) : (
             <div className="empty-state">
-              <p>スプレッドシートURLを入力するか、CSVをアップロードしてください。</p>
+              <p>固定スプレッドシートから回答を読み込んでください。</p>
             </div>
           )}
         </section>
@@ -604,11 +661,19 @@ function App() {
                 <p className="panel-kicker">Teams</p>
                 <h2>グループ番号と名前の一覧</h2>
               </div>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={openBoardPage}
+                disabled={result.groups.length === 0}
+              >
+                別ページで表示
+              </button>
             </div>
 
             {result.groups.length === 0 ? (
               <div className="empty-state">
-                <p>CSVを読み込み、列を選んでからチーム表を作成してください。</p>
+                <p>シートを読み込み、設定を確認してからチーム表を作成してください。</p>
               </div>
             ) : (
               <div className="group-grid">
@@ -620,6 +685,99 @@ function App() {
           </section>
         </section>
       </main>
+    </div>
+  )
+}
+
+function BoardPage() {
+  const [snapshot, setSnapshot] = useState<BoardSnapshot | null>(() => readBoardSnapshot())
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
+
+  useEffect(() => {
+    const syncSnapshot = () => {
+      setSnapshot(readBoardSnapshot())
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== BOARD_STORAGE_KEY) {
+        return
+      }
+
+      syncSnapshot()
+    }
+
+    window.addEventListener('storage', handleStorage)
+    window.addEventListener('focus', syncSnapshot)
+
+    return () => {
+      window.removeEventListener('storage', handleStorage)
+      window.removeEventListener('focus', syncSnapshot)
+    }
+  }, [])
+
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth)
+    }
+
+    window.addEventListener('resize', handleResize)
+
+    return () => {
+      window.removeEventListener('resize', handleResize)
+    }
+  }, [])
+
+  if (!snapshot) {
+    return (
+      <div className="board-page">
+        <div className="board-empty">
+          <p className="eyebrow">Group Board</p>
+          <h1>グループ表示データがありません</h1>
+          <p className="lead-copy">
+            設定画面でチーム表を生成してから、別ページ表示を開いてください。
+          </p>
+          <a className="primary-button" href={buildMainPageUrl()}>
+            設定画面に戻る
+          </a>
+        </div>
+      </div>
+    )
+  }
+
+  const boardLayout = getBoardLayout(snapshot.groups, viewportWidth)
+  const boardDisplay = getBoardDisplaySettings(snapshot.groups, boardLayout.rows)
+  const boardGridStyle = {
+    '--board-columns': String(boardLayout.columns),
+    '--board-rows': String(boardLayout.rows),
+    '--board-column-width': `${boardLayout.columnWidth}px`,
+    '--board-card-gap': `${boardDisplay.cardGap}px`,
+    '--board-card-padding-y': `${boardDisplay.cardPaddingY}px`,
+    '--board-card-padding-x': `${boardDisplay.cardPaddingX}px`,
+    '--board-member-gap': `${boardDisplay.memberGap}px`,
+    '--board-member-font-size': `${boardDisplay.memberFontSize}rem`,
+    '--board-member-line-height': String(boardDisplay.memberLineHeight),
+    '--board-label-font-size': `${boardDisplay.labelFontSize}rem`,
+    '--board-label-line-height': String(boardDisplay.labelLineHeight),
+  } as CSSProperties
+
+  return (
+    <div className={`board-page ${boardLayout.densityClass}`}>
+      <section className="board-frame">
+        <div className="board-grid" style={boardGridStyle}>
+          {snapshot.groups.map((group, index) => (
+            <article key={group.id} className={`board-card board-tone-${index % 3}`}>
+              <p className="board-group-label">＜{index + 1}班＞</p>
+              <ul className="board-member-list">
+                {group.members.map((member, memberIndex) => (
+                  <li key={`${group.id}-${memberIndex}`} className="board-member">
+                    {member}
+                  </li>
+                ))}
+              </ul>
+            </article>
+          ))}
+        </div>
+      </section>
     </div>
   )
 }
@@ -671,7 +829,10 @@ function detectColumn(headers: string[], pattern: RegExp) {
 function detectQuestionColumns(headers: string[]): QuestionColumns {
   return (Object.keys(QUESTION_PATTERNS) as QuestionColumnKey[]).reduce<QuestionColumns>(
     (accumulator, key) => {
-      accumulator[key] = detectColumn(headers, QUESTION_PATTERNS[key]) ?? ''
+      accumulator[key] =
+        headers.find((header) => header === PREFERRED_QUESTION_HEADERS[key]) ??
+        detectColumn(headers, QUESTION_PATTERNS[key]) ??
+        ''
       return accumulator
     },
     { ...EMPTY_QUESTION_COLUMNS },
@@ -704,6 +865,226 @@ function buildDefaultSelection(headers: string[]): {
     mbtiColumn,
     questionColumns,
     mode,
+  }
+}
+
+function resolveImportSelection(
+  headers: string[],
+  currentSelection: ImportSelection,
+): ImportSelection {
+  const defaults = buildDefaultSelection(headers)
+  const availableHeaders = new Set(headers)
+  const nameColumn = availableHeaders.has(currentSelection.nameColumn)
+    ? currentSelection.nameColumn
+    : defaults.nameColumn
+  const mbtiColumn = availableHeaders.has(currentSelection.mbtiColumn)
+    ? currentSelection.mbtiColumn
+    : defaults.mbtiColumn
+  const questionColumns = (Object.keys(QUESTION_LABELS) as QuestionColumnKey[]).reduce<QuestionColumns>(
+    (accumulator, key) => {
+      accumulator[key] = availableHeaders.has(currentSelection.questionColumns[key])
+        ? currentSelection.questionColumns[key]
+        : defaults.questionColumns[key]
+      return accumulator
+    },
+    { ...EMPTY_QUESTION_COLUMNS },
+  )
+
+  let mode = currentSelection.mode
+
+  if (mode === 'questionnaire' && !allQuestionColumnsSelected(questionColumns)) {
+    mode = defaults.mode
+  }
+
+  if (mode === 'direct' && !mbtiColumn) {
+    mode = defaults.mode
+  }
+
+  return {
+    nameColumn,
+    mbtiColumn,
+    questionColumns,
+    mode,
+  }
+}
+
+function createDataSignature(dataset: CsvDataSet) {
+  return JSON.stringify([dataset.headers, dataset.rows])
+}
+
+function formatSyncLabel(timestamp: Date) {
+  return timestamp.toLocaleTimeString('ja-JP', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function getAppView() {
+  if (typeof window === 'undefined') {
+    return 'main'
+  }
+
+  return new URLSearchParams(window.location.search).get('view') === 'board' ? 'board' : 'main'
+}
+
+function buildBoardPageUrl() {
+  const url = new URL(window.location.href)
+  url.searchParams.set('view', 'board')
+  url.hash = ''
+  return url.toString()
+}
+
+function buildFormPageUrl() {
+  const url = new URL('form.html', window.location.href)
+  url.hash = ''
+  return url.toString()
+}
+
+function buildMainPageUrl() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('view')
+  url.hash = ''
+  return url.toString()
+}
+
+function createBoardSnapshot({
+  groups,
+  sourceName,
+  totalParticipants,
+  targetSize,
+}: {
+  groups: GeneratedParticipantGroup[]
+  sourceName: string | null
+  totalParticipants: number
+  targetSize: number
+}): BoardSnapshot {
+  return {
+    createdAt: new Date().toLocaleString('ja-JP'),
+    sourceName,
+    totalParticipants,
+    targetSize,
+    groups: groups.map((group, index) => ({
+      id: group.id,
+      label: `Group ${index + 1}`,
+      members: group.members.map((member) => member.name),
+    })),
+  }
+}
+
+function writeBoardSnapshot(snapshot: BoardSnapshot) {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  window.localStorage.setItem(BOARD_STORAGE_KEY, JSON.stringify(snapshot))
+}
+
+function readBoardSnapshot() {
+  if (typeof window === 'undefined') {
+    return null
+  }
+
+  const rawSnapshot = window.localStorage.getItem(BOARD_STORAGE_KEY)
+
+  if (!rawSnapshot) {
+    return null
+  }
+
+  try {
+    return JSON.parse(rawSnapshot) as BoardSnapshot
+  } catch {
+    return null
+  }
+}
+
+function getBoardLayout(groups: BoardGroupSnapshot[], viewportWidth: number) {
+  const groupCount = groups.length
+
+  if (groupCount <= 1) {
+    return { columns: 1, rows: 1, densityClass: '', columnWidth: 220 }
+  }
+
+  const longestMemberLength = groups.reduce(
+    (max, group) =>
+      Math.max(max, ...group.members.map((member) => member.length), group.label.length),
+    0,
+  )
+  const estimatedCardWidth = Math.min(240, Math.max(172, longestMemberLength * 13 + 54))
+  const availableWidth = Math.min(1240, Math.max(320, viewportWidth - 36))
+  let columns = Math.min(5, groupCount)
+
+  while (
+    columns > 1 &&
+    columns * estimatedCardWidth + (columns - 1) * 12 > availableWidth
+  ) {
+    columns -= 1
+  }
+
+  const rows = Math.ceil(groupCount / columns)
+
+  if (groupCount >= 13 || rows >= 4) {
+    return { columns, rows, densityClass: 'board-dense', columnWidth: estimatedCardWidth }
+  }
+
+  if (groupCount >= 9 || rows >= 3) {
+    return { columns, rows, densityClass: 'board-compact', columnWidth: estimatedCardWidth }
+  }
+
+  return { columns, rows, densityClass: '', columnWidth: estimatedCardWidth }
+}
+
+function getBoardDisplaySettings(groups: BoardGroupSnapshot[], rows: number) {
+  const maxMembers = groups.reduce((max, group) => Math.max(max, group.members.length), 0)
+
+  if (rows >= 4 || (rows >= 3 && maxMembers >= 6)) {
+    return {
+      cardGap: 4,
+      cardPaddingY: 7,
+      cardPaddingX: 9,
+      memberGap: 1,
+      memberFontSize: 0.68,
+      memberLineHeight: 1.2,
+      labelFontSize: 0.78,
+      labelLineHeight: 1.15,
+    }
+  }
+
+  if (rows >= 3 || maxMembers >= 6) {
+    return {
+      cardGap: 6,
+      cardPaddingY: 9,
+      cardPaddingX: 11,
+      memberGap: 2,
+      memberFontSize: 0.78,
+      memberLineHeight: 1.25,
+      labelFontSize: 0.88,
+      labelLineHeight: 1.2,
+    }
+  }
+
+  if (rows >= 2 || maxMembers >= 5) {
+    return {
+      cardGap: 7,
+      cardPaddingY: 10,
+      cardPaddingX: 12,
+      memberGap: 3,
+      memberFontSize: 0.88,
+      memberLineHeight: 1.3,
+      labelFontSize: 0.94,
+      labelLineHeight: 1.25,
+    }
+  }
+
+  return {
+    cardGap: 8,
+    cardPaddingY: 12,
+    cardPaddingX: 14,
+    memberGap: 4,
+    memberFontSize: 0.96,
+    memberLineHeight: 1.4,
+    labelFontSize: 0.98,
+    labelLineHeight: 1.3,
   }
 }
 
@@ -951,19 +1332,24 @@ function buildDataSetFromJson(sourceName: string, rawText: string): CsvDataSet {
     headers?: unknown
     rows?: unknown
     values?: unknown
+    sheet?: unknown
   }
+  const resolvedSourceName =
+    typeof record.sheet === 'string' && record.sheet.trim().length > 0
+      ? record.sheet.trim()
+      : sourceName
 
   if (Array.isArray(record.rows)) {
     if (Array.isArray(record.headers) && record.rows.every(Array.isArray)) {
-      return buildArrayRowDataSet(sourceName, record.headers, record.rows)
+      return buildArrayRowDataSet(resolvedSourceName, record.headers, record.rows)
     }
 
-    return buildObjectRowDataSet(sourceName, record.rows)
+    return buildObjectRowDataSet(resolvedSourceName, record.rows)
   }
 
   if (Array.isArray(record.values)) {
     const [headers = [], ...rows] = record.values as unknown[]
-    return buildArrayRowDataSet(sourceName, headers, rows)
+    return buildArrayRowDataSet(resolvedSourceName, headers, rows)
   }
 
   throw new Error('対応していない JSON 形式です。')
