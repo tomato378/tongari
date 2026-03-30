@@ -195,6 +195,7 @@ export default function MbtiQuickDiagnosisForm({ questions }: MbtiQuickDiagnosis
           const axisChoice = choices[axis]
           const axisQuestions = questions[axis]
           const axisAnswered = Boolean(axisChoice.selectedValue)
+          const questionCountLabel = `${axisQuestions.length}問の中から1つ選択`
 
           return (
             <section key={axis} className="section-card">
@@ -202,6 +203,7 @@ export default function MbtiQuickDiagnosisForm({ questions }: MbtiQuickDiagnosis
                 <div className="section-copy-block">
                   <p className="section-kicker">{sectionLabel}</p>
                   <h2>質問を1つ選んで回答してください</h2>
+                  <p className="section-meta">{questionCountLabel}</p>
                 </div>
                 <span className={`section-state ${axisAnswered ? 'is-complete' : ''}`}>
                   {axisAnswered ? '回答済み' : '未回答'}
@@ -278,7 +280,7 @@ export default function MbtiQuickDiagnosisForm({ questions }: MbtiQuickDiagnosis
       <footer className="submit-card">
         <div className="submit-copy-block">
           <p className="submit-title">送信</p>
-          <p className="submit-copy">4つすべてのセクションに回答すると送信できます。</p>
+          <p className="submit-copy">すべてのセクションに回答すると送信できます。</p>
         </div>
 
         <button type="submit" className="submit-button" disabled={!canSubmit}>
@@ -304,7 +306,7 @@ export default function MbtiQuickDiagnosisForm({ questions }: MbtiQuickDiagnosis
 function collectSelectedAnswers(
   questions: MbtiQuestions,
   choices: Record<AxisKey, AxisChoice>,
-): [SelectedAnswer, SelectedAnswer, SelectedAnswer, SelectedAnswer] | null {
+): SelectedAnswer[] | null {
   const selectedAnswers = AXES.map((axis) => {
     const axisChoice = choices[axis]
     const selectedQuestion = questions[axis].find(
@@ -333,5 +335,5 @@ function collectSelectedAnswers(
     return null
   }
 
-  return selectedAnswers as [SelectedAnswer, SelectedAnswer, SelectedAnswer, SelectedAnswer]
+  return selectedAnswers.filter((answer): answer is SelectedAnswer => answer !== null)
 }

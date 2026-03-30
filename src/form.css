@@ -209,6 +209,12 @@ h2 {
   gap: 2px;
 }
 
+.section-meta {
+  color: var(--text-subtle);
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
 .section-state {
   display: inline-flex;
   align-items: center;

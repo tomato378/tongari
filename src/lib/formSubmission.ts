@@ -12,7 +12,7 @@ interface SelectedAnswer {
 
 interface SubmitSurveyResponseInput {
   respondentName: string
-  answers: [SelectedAnswer, SelectedAnswer, SelectedAnswer, SelectedAnswer]
+  answers: SelectedAnswer[]
 }
 
 interface SheetBridgeResponse {
@@ -82,10 +82,14 @@ function buildSubmissionRow({
 
   answers.forEach((answer, index) => {
     const answerLetter = answer.optionIndex === 0 ? 'A' : 'B'
-    row[GROUPING_RESPONSE_HEADERS[index]] = answerLetter
+    row[getGroupingResponseHeader(index)] = answerLetter
   })
 
   return row
+}
+
+function getGroupingResponseHeader(index: number) {
+  return GROUPING_RESPONSE_HEADERS[index] ?? `セクション${index + 1}の回答`
 }
 
 function tryParseSheetBridgeResponse(rawText: string) {
